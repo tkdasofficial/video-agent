@@ -23,6 +23,10 @@ IMAGE_STYLE = os.environ.get("IMAGE_STYLE", "cinematic")
 ASPECT_RATIO = os.environ.get("ASPECT_RATIO", "9:16")
 
 PIXAZO_API_KEY = os.environ.get("PIXAZO_API_KEY", "")
+# Set only when you have a real Pixazo (or OpenAI-compatible) image endpoint,
+# e.g. PIXAZO_BASE_URL=https://api.your-provider.com
+# Leave unset to generate scenes with Cloudflare Workers AI instead.
+PIXAZO_BASE_URL = os.environ.get("PIXAZO_BASE_URL", "").rstrip("/")
 CF_ACCOUNT_ID = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "")
 CF_API_TOKEN = os.environ.get("CLOUDFLARE_API_TOKEN", "")
 
@@ -54,33 +58,80 @@ def log(message: str, step: str | None = None, progress: int | None = None) -> N
     patch(payload)
 
 
+def _save_image_from_json(body: dict, path: str) -> bool:
+    import base64
+
+    # Cloudflare Workers AI shape: {"result": {"image": "<b64>"}}
+    result = body.get("result") or {}
+    b64 = result.get("image") if isinstance(result, dict) else None
+    # OpenAI-compatible shape: {"data": [{"url"|"b64_json": ...}]}
+    if not b64 and body.get("data"):
+        item = body["data"][0]
+        if item.get("url"):
+            with open(path, "wb") as handle:
+                handle.write(requests.get(item["url"], timeout=180).content)
+            return True
+        b64 = item.get("b64_json")
+    if not b64:
+        return False
+    with open(path, "wb") as handle:
+        handle.write(base64.b64decode(b64))
+    return True
+
+
+def scene_via_cloudflare(prompt: str, path: str) -> None:
+    model = os.environ.get("CF_IMAGE_MODEL", "@cf/black-forest-labs/flux-1-schnell")
+    response = requests.post(
+        f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/run/{model}",
+        headers={"Authorization": f"Bearer {CF_API_TOKEN}"},
+        json={"prompt": prompt, "steps": 6},
+        timeout=180,
+    )
+    response.raise_for_status()
+    if "application/json" in response.headers.get("content-type", ""):
+        if _save_image_from_json(response.json(), path):
+            return
+        raise RuntimeError("Cloudflare image response contained no image data")
+    with open(path, "wb") as handle:
+        handle.write(response.content)
+
+
+def scene_via_pixazo(prompt: str, path: str) -> None:
+    response = requests.post(
+        f"{PIXAZO_BASE_URL}/v1/images/generations",
+        headers={"Authorization": f"Bearer {PIXAZO_API_KEY}"},
+        json={
+            "prompt": prompt,
+            "negative_prompt": NEGATIVE_PROMPT,
+            "width": WIDTH,
+            "height": HEIGHT,
+        },
+        timeout=180,
+    )
+    response.raise_for_status()
+    if not _save_image_from_json(response.json(), path):
+        raise RuntimeError("Pixazo image response contained no image data")
+
+
 def generate_scenes() -> list[str]:
-    log("Generating scene images with Pixazo", "Generating scenes", 20)
+    use_pixazo = bool(PIXAZO_API_KEY and PIXAZO_BASE_URL)
+    provider = "Pixazo" if use_pixazo else "Cloudflare Workers AI"
+    log(f"Generating scene images with {provider}", "Generating scenes", 20)
     paths = []
     for i in range(SCENE_COUNT):
         path = f"scene_{i}.jpg"
-        response = requests.post(
-            "https://api.pixazo.com/v1/images/generations",
-            headers={"Authorization": f"Bearer {PIXAZO_API_KEY}"},
-            json={
-                "prompt": f"{PROMPT}, {IMAGE_STYLE}, scene {i + 1} of {SCENE_COUNT}",
-                "negative_prompt": NEGATIVE_PROMPT,
-                "width": WIDTH,
-                "height": HEIGHT,
-            },
-            timeout=180,
+        scene_prompt = (
+            f"{PROMPT}, {IMAGE_STYLE}, scene {i + 1} of {SCENE_COUNT}"
+            + (f", avoid: {NEGATIVE_PROMPT}" if NEGATIVE_PROMPT else "")
         )
-        response.raise_for_status()
-        body = response.json()
-        image_url = body["data"][0].get("url")
-        if image_url:
-            with open(path, "wb") as handle:
-                handle.write(requests.get(image_url, timeout=180).content)
+        if use_pixazo:
+            try:
+                scene_via_pixazo(scene_prompt, path)
+            except Exception as error:  # noqa: BLE001
+                log(f"Pixazo unavailable ({error}); falling back to Cloudflare Workers AI")
+                scene_via_cloudflare(scene_prompt, path)
         else:
-            import base64
-
-            with open(path, "wb") as handle:
-                handle.write(base64.b64decode(body["data"][0]["b64_json"]))
+            scene_via_cloudflare(scene_prompt, path)
         paths.append(path)
     return paths
 
