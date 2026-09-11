@@ -26,20 +26,14 @@ jobs:
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
       VIDEO_ID: ${{ github.event.client_payload.video_id }}
       USER_ID: ${{ github.event.client_payload.user_id }}
+      # Nine flat properties keep repository_dispatch below GitHub's limit.
       PROMPT: ${{ github.event.client_payload.prompt }}
       NEGATIVE_PROMPT: ${{ github.event.client_payload.negative_prompt }}
       VOICE_GENDER: ${{ github.event.client_payload.voice_gender }}
-      VOICE_PERSONA: ${{ github.event.client_payload.voice_persona }}
-      VOICE_SPEED: ${{ github.event.client_payload.voice_speed }}
-      VOICE_PITCH: ${{ github.event.client_payload.voice_pitch }}
       IMAGE_STYLE: ${{ github.event.client_payload.image_style }}
-      MOTION_TEMPLATE: ${{ github.event.client_payload.motion_template }}
       ASPECT_RATIO: ${{ github.event.client_payload.aspect_ratio }}
       DURATION_SECONDS: ${{ github.event.client_payload.duration_seconds }}
       CAPTIONS: ${{ github.event.client_payload.captions }}
-      CAPTION_STYLE: ${{ github.event.client_payload.caption_style }}
-      QUALITY: ${{ github.event.client_payload.quality }}
-      BITRATE: ${{ github.event.client_payload.bitrate }}
     steps:
       - uses: actions/checkout@v4
 
