@@ -15,15 +15,18 @@ jobs:
     env:
       SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
       SUPABASE_SERVICE_ROLE_KEY: ${{ secrets.SUPABASE_SERVICE_ROLE_KEY }}
-      # Pixazo AI powers scene images and the TTS voiceover.
+      # Pixazo AI powers scene images ONLY (it has no TTS API).
       PIXAZO_API_KEY: ${{ secrets.PIXAZO_API_KEY }}
-      # Optional overrides; defaults are https://api.pixazo.ai + free-tier models.
+      # Optional overrides; defaults are https://api.pixazo.ai + free-tier model.
       PIXAZO_BASE_URL: ${{ secrets.PIXAZO_BASE_URL }}
       PIXAZO_IMAGE_MODEL: ${{ secrets.PIXAZO_IMAGE_MODEL }}
-      PIXAZO_TTS_MODEL: ${{ secrets.PIXAZO_TTS_MODEL }}
-      # Cloudflare Workers AI is the LLM brain (script + scene prompts).
+      # Cloudflare Workers AI: script + scene prompts, narration TTS, image fallback.
       CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
       CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      # Optional model overrides (comma-separated, tried in order).
+      CF_LLM_MODEL: ${{ secrets.CF_LLM_MODEL }}
+      CF_TTS_MODEL: ${{ secrets.CF_TTS_MODEL }}
+      CF_IMAGE_MODEL: ${{ secrets.CF_IMAGE_MODEL }}
       VIDEO_ID: ${{ github.event.client_payload.video_id }}
       USER_ID: ${{ github.event.client_payload.user_id }}
       # Nine flat properties keep repository_dispatch below GitHub's limit.
