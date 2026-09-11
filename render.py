@@ -4,10 +4,11 @@ Copy to the repo root as `render.py` (alongside `requirements.txt`).
 
 Pipeline
 --------
-1. Cloudflare Workers AI (`@cf/meta/llama-3-8b-instruct`) writes the narration
-   script and the per-scene image prompts (the "brain").
-2. Pixazo AI (https://api.pixazo.ai) renders the scene images (free-tier image
-   model) and synthesises the voiceover (Pixazo TTS).
+1. Cloudflare Workers AI (Llama instruct models) writes the narration script and
+   the per-scene image prompts (the "brain"), and synthesises the voiceover with
+   Workers AI TTS (Deepgram Aura, MeloTTS fallback).
+2. Pixazo AI (https://api.pixazo.ai) renders the scene images ONLY, with Workers
+   AI image models as fallback. Pixazo exposes no TTS API.
 3. FFmpeg composes scenes + narration, applies the motion template, and burns
    captions from a generated SRT when captions are enabled.
 
@@ -58,7 +59,7 @@ PIXAZO_BASE_URL = env("PIXAZO_BASE_URL", "https://api.pixazo.ai").rstrip("/")
 if not PIXAZO_BASE_URL.startswith(("http://", "https://")):
     PIXAZO_BASE_URL = f"https://{PIXAZO_BASE_URL}"
 PIXAZO_IMAGE_MODEL = env("PIXAZO_IMAGE_MODEL", "pixazo-image-free")
-PIXAZO_TTS_MODEL = env("PIXAZO_TTS_MODEL", "pixazo-tts-1")
+# Pixazo is images only. Narration/TTS runs on Cloudflare Workers AI.
 
 CF_ACCOUNT_ID = env("CLOUDFLARE_ACCOUNT_ID")
 CF_API_TOKEN = env("CLOUDFLARE_API_TOKEN")
@@ -84,6 +85,19 @@ CF_LLM_MODELS = [
     ).split(",")
     if model.strip()
 ]
+CF_TTS_MODELS = [
+    model.strip()
+    for model in env(
+        "CF_TTS_MODEL",
+        "@cf/deepgram/aura-1,@cf/myshell-ai/melotts",
+    ).split(",")
+    if model.strip()
+]
+# Deepgram Aura speaker names, chosen by the requested voice gender.
+CF_AURA_SPEAKER = env(
+    "CF_AURA_SPEAKER",
+    "orion" if VOICE_GENDER.startswith("m") else "luna",
+)
 
 SIZES_1080 = {"9:16": (1080, 1920), "16:9": (1920, 1080), "1:1": (1080, 1080)}
 SIZES_720 = {"9:16": (720, 1280), "16:9": (1280, 720), "1:1": (720, 720)}
@@ -199,7 +213,7 @@ def write_script() -> tuple[str, list[str]]:
     return script, scenes[:SCENE_COUNT]
 
 
-# --- Stage B: Pixazo AI images + TTS ---------------------------------------
+# --- Stage B: Pixazo AI images (Workers AI fallback) + Workers AI TTS -------
 def pixazo_post(path: str, body: dict, *, timeout: int = 240) -> requests.Response:
     if not PIXAZO_API_KEY:
         raise RuntimeError("PIXAZO_API_KEY is not configured")
@@ -245,7 +259,7 @@ def save_binary_or_b64(response: requests.Response, path: str, keys: tuple[str, 
                 with open(path, "wb") as handle:
                     handle.write(base64.b64decode(payload))
                 return
-    raise RuntimeError(f"Pixazo response contained no media: {json.dumps(body)[:300]}")
+    raise RuntimeError(f"Provider response contained no media: {json.dumps(body)[:300]}")
 
 
 def cloudflare_image(scene_prompt: str, path: str) -> None:
@@ -305,20 +319,28 @@ def generate_scenes(scene_prompts: list[str]) -> list[str]:
 
 
 def generate_voice(script: str) -> str:
-    log(f"Synthesising narration with Pixazo TTS ({VOICE_GENDER})", "Generating voice", 52)
-    path = "voice.mp3"
-    response = pixazo_post(
-        "/v1/audio/speech",
-        {
-            "model": PIXAZO_TTS_MODEL,
-            "input": script,
-            "voice": VOICE_GENDER,
-            "persona": VOICE_PERSONA,
-            "response_format": "mp3",
-        },
+    """Narration comes from Cloudflare Workers AI TTS (Pixazo has no TTS API)."""
+    log(
+        f"Synthesising narration with Cloudflare Workers AI TTS ({VOICE_GENDER})",
+        "Generating voice",
+        52,
     )
-    save_binary_or_b64(response, path, ("b64_json", "audio", "audio_base64"))
-    return path
+    path = "voice.mp3"
+    text = script.strip()[:1800]
+    errors: list[str] = []
+    for model in CF_TTS_MODELS:
+        if "aura" in model:
+            body = {"text": text, "speaker": CF_AURA_SPEAKER, "encoding": "mp3"}
+        else:
+            # MeloTTS takes plain text plus a language code and returns base64 mp3.
+            body = {"prompt": text, "lang": env("CF_TTS_LANG", "en")}
+        try:
+            response = cloudflare_run(model, body, timeout=240)
+            save_binary_or_b64(response, path, ("b64_json", "audio", "audio_base64"))
+            return path
+        except Exception as error:  # noqa: BLE001 - try the next TTS model
+            errors.append(f"{model}: {error}")
+    raise RuntimeError("no Workers AI TTS model succeeded — " + " | ".join(errors))
 
 
 # --- Stage C: captions + FFmpeg composition --------------------------------
