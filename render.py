@@ -141,9 +141,22 @@ def write_script() -> tuple[str, list[str]]:
         except Exception as error:  # noqa: BLE001 - retired/unavailable model, try the next
             log(f"Script model {model} unavailable ({error}); trying the next one")
             continue
-        text = (raw.get("result") or {}).get("response") or ""
-        if text:
+
+        # Cloudflare Workers AI response shape changed over time:
+        # { "result": { "response": "..." } } or { "response": "..." }
+        result = raw.get("result") or raw
+        if isinstance(result, dict):
+            candidate = result.get("response")
+            if candidate is None:
+                candidate = result.get("result")
+            text = str(candidate) if candidate is not None else ""
+        else:
+            text = str(result) if result is not None else ""
+        if text and text != "None":
             break
+
+    # Always coerce to a plain string before string operations.
+    text = str(text)
     start, end = text.find("{"), text.rfind("}")
     script, scenes = "", []
     if start != -1 and end > start:
