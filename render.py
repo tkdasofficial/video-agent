@@ -52,7 +52,18 @@ PIXAZO_TTS_MODEL = os.environ.get("PIXAZO_TTS_MODEL", "pixazo-tts-1")
 
 CF_ACCOUNT_ID = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "")
 CF_API_TOKEN = os.environ.get("CLOUDFLARE_API_TOKEN", "")
-CF_LLM_MODEL = os.environ.get("CF_LLM_MODEL", "@cf/meta/llama-3-8b-instruct")
+# Workers AI retires older model ids (HTTP 410 Gone), so try current ones in order.
+CF_LLM_MODELS = [
+    model.strip()
+    for model in os.environ.get(
+        "CF_LLM_MODEL",
+        "@cf/meta/llama-3.3-70b-instruct-fp8-fast,"
+        "@cf/meta/llama-3.1-8b-instruct,"
+        "@cf/meta/llama-3.1-8b-instruct-fast,"
+        "@cf/mistralai/mistral-small-3.1-24b-instruct",
+    ).split(",")
+    if model.strip()
+]
 
 SIZES_1080 = {"9:16": (1080, 1920), "16:9": (1920, 1080), "1:1": (1080, 1080)}
 SIZES_720 = {"9:16": (720, 1280), "16:9": (1280, 720), "1:1": (720, 720)}
@@ -123,8 +134,16 @@ def write_script() -> tuple[str, list[str]]:
         ],
         "max_tokens": 900,
     }
-    raw = cloudflare_run(CF_LLM_MODEL, body).json()
-    text = (raw.get("result") or {}).get("response") or ""
+    text = ""
+    for model in CF_LLM_MODELS:
+        try:
+            raw = cloudflare_run(model, body).json()
+        except Exception as error:  # noqa: BLE001 - retired/unavailable model, try the next
+            log(f"Script model {model} unavailable ({error}); trying the next one")
+            continue
+        text = (raw.get("result") or {}).get("response") or ""
+        if text:
+            break
     start, end = text.find("{"), text.rfind("}")
     script, scenes = "", []
     if start != -1 and end > start:
