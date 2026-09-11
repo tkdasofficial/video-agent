@@ -197,6 +197,40 @@ def trim_to_budget(script: str) -> str:
     return trimmed
 
 
+def ensure_script_length(script: str, minimum_words: int) -> str:
+    """Keep narration dense enough to occupy the requested runtime."""
+    if len(script.split()) >= minimum_words:
+        return trim_to_budget(script)
+
+    expanded = clean_script(
+        cf_chat(
+            "You expand narration for humanless nature and cosmic short films. "
+            "Reply with narration sentences only.",
+            f"Topic: {PROMPT}\nCurrent narration: {script}\n"
+            f"Rewrite this as {minimum_words} to {WORD_BUDGET} flowing words. "
+            "Keep the meaning, use no humans, labels, lists, or stage directions.",
+            max_tokens=500,
+        )
+    )
+    if len(expanded.split()) >= minimum_words:
+        return trim_to_budget(expanded)
+
+    # A provider can occasionally return an empty/very short answer. Preserve the
+    # selected runtime with neutral scenery narration rather than a silent tail.
+    pieces = [script or PROMPT]
+    bridges = [
+        "Across this vast scene, light and motion reveal details shaped quietly through time.",
+        "Colors drift through the landscape while distant forms create depth, rhythm, and wonder.",
+        "Every changing texture invites a closer look at the beauty held within this world.",
+        "The view continues beyond the horizon, calm, immense, and alive with subtle movement.",
+    ]
+    index = 0
+    while len(" ".join(pieces).split()) < minimum_words:
+        pieces.append(bridges[index % len(bridges)])
+        index += 1
+    return trim_to_budget(" ".join(pieces))
+
+
 def cf_chat(system: str, user: str, *, max_tokens: int = 700) -> str:
     """Runs a chat prompt through the first Workers AI model that answers."""
     body = {
@@ -301,7 +335,7 @@ def write_script() -> tuple[str, list[str]]:
     if not script:
         log("Script model gave no usable text; narrating the prompt directly", None, None)
         script = PROMPT
-    script = trim_to_budget(script)
+    script = ensure_script_length(script, lower)
     log(f"Script ready ({len(script.split())} words / {WORD_BUDGET} max)")
 
     scenes = parse_scenes(
@@ -558,19 +592,31 @@ def motion_filter(per_scene: float) -> str:
     return f"zoompan=z='min(zoom+0.003,1.30)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames}:s={WIDTH}x{HEIGHT}:fps=30"
 
 
+def atempo_filter(rate: float) -> str:
+    """Build a legal FFmpeg atempo chain for any positive speed ratio."""
+    rate = max(rate, 0.01)
+    factors: list[float] = []
+    while rate < 0.5:
+        factors.append(0.5)
+        rate /= 0.5
+    while rate > 2.0:
+        factors.append(2.0)
+        rate /= 2.0
+    factors.append(rate)
+    return ",".join(f"atempo={factor:.6f}" for factor in factors)
+
+
 def compose(scenes: list[str], voice: str, script: str) -> None:
     log("Composing final video with FFmpeg", "Rendering video", 78)
     narration = audio_duration(voice)
 
-    # The video length follows the narration so a short voiceover never leaves
-    # the clip ending in dead silence, and never exceeds the selected duration.
-    tail = 0.6
-    total = min(float(DURATION), max(2.0, narration + tail))
-    if narration + tail < DURATION - 0.5:
-        log(
-            f"Narration is {narration:.1f}s, so the clip is trimmed to "
-            f"{total:.1f}s instead of {DURATION}s"
-        )
+    # The requested duration is authoritative. Retiming the narration avoids a
+    # long silent gap when a TTS provider speaks faster than expected.
+    total = float(DURATION)
+    narration_target = max(0.5, total - 0.25)
+    tempo = narration / narration_target
+    if abs(narration - narration_target) > 0.25:
+        log(f"Fitting {narration:.1f}s narration to the selected {DURATION}s runtime")
     per_scene = total / len(scenes)
 
     with open("scenes.txt", "w", encoding="utf-8") as handle:
@@ -584,7 +630,7 @@ def compose(scenes: list[str], voice: str, script: str) -> None:
         motion_filter(per_scene),
     ]
     if CAPTIONS:
-        filters.append(caption_filter(write_ass(script, min(total, narration))))
+        filters.append(caption_filter(write_ass(script, narration_target)))
     else:
         log("Captions disabled for this render", None, None)
     filters.append("format=yuv420p")
@@ -594,7 +640,8 @@ def compose(scenes: list[str], voice: str, script: str) -> None:
         "-f", "concat", "-safe", "0", "-i", "scenes.txt",
         "-i", voice,
         "-filter_complex",
-        f"[0:v]{','.join(filters)}[v];[1:a]apad,atrim=0:{total:.3f},asetpts=N/SR/TB[a]",
+        f"[0:v]{','.join(filters)}[v];[1:a]{atempo_filter(tempo)},apad,"
+        f"atrim=0:{total:.3f},asetpts=N/SR/TB[a]",
         "-map", "[v]", "-map", "[a]",
         "-c:v", "libx264", "-preset", "medium", "-crf", "20", "-b:v", VIDEO_BITRATE,
         "-c:a", "aac", "-b:a", "192k",
