@@ -27,35 +27,45 @@ SUPABASE_URL = os.environ["SUPABASE_URL"].rstrip("/")
 SERVICE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 VIDEO_ID = os.environ["VIDEO_ID"]
 
-PROMPT = os.environ.get("PROMPT", "")
-NEGATIVE_PROMPT = os.environ.get("NEGATIVE_PROMPT", "")
-VOICE_GENDER = os.environ.get("VOICE_GENDER", "female").lower()
-VOICE_PERSONA = os.environ.get("VOICE_PERSONA", "Cinematic Narrator")
-IMAGE_STYLE = os.environ.get("IMAGE_STYLE", "Cinematic 3D")
-MOTION_TEMPLATE = os.environ.get("MOTION_TEMPLATE", "Auto Zoom-In")
-ASPECT_RATIO = os.environ.get("ASPECT_RATIO", "9:16")
-CAPTION_STYLE = os.environ.get("CAPTION_STYLE", "Neon Glow")
-CAPTIONS = os.environ.get("CAPTIONS", "false").strip().lower() in {"1", "true", "yes", "on"}
-QUALITY = os.environ.get("QUALITY", "1080p")
-BITRATE = os.environ.get("BITRATE", "High")
+def env(name: str, default: str = "") -> str:
+    """Unset or blank GitHub Action inputs arrive as empty strings."""
+    return (os.environ.get(name) or "").strip() or default
+
+
+PROMPT = env("PROMPT")
+NEGATIVE_PROMPT = env("NEGATIVE_PROMPT")
+VOICE_GENDER = env("VOICE_GENDER", "female").lower()
+VOICE_PERSONA = env("VOICE_PERSONA", "Cinematic Narrator")
+IMAGE_STYLE = env("IMAGE_STYLE", "Cinematic 3D")
+MOTION_TEMPLATE = env("MOTION_TEMPLATE", "Auto Zoom-In")
+ASPECT_RATIO = env("ASPECT_RATIO", "9:16")
+CAPTION_STYLE = env("CAPTION_STYLE", "Neon Glow")
+CAPTIONS = env("CAPTIONS", "false").lower() in {"1", "true", "yes", "on"}
+QUALITY = env("QUALITY", "1080p")
+BITRATE = env("BITRATE", "High")
 
 try:
-    DURATION = max(1, min(60, int(float(os.environ.get("DURATION_SECONDS", "15")))))
+    DURATION = max(1, min(60, int(float(env("DURATION_SECONDS", "15")))))
 except ValueError:
     DURATION = 15
 
 # --- Providers -------------------------------------------------------------
-PIXAZO_API_KEY = os.environ.get("PIXAZO_API_KEY", "")
-PIXAZO_BASE_URL = os.environ.get("PIXAZO_BASE_URL", "https://api.pixazo.ai").rstrip("/")
-PIXAZO_IMAGE_MODEL = os.environ.get("PIXAZO_IMAGE_MODEL", "pixazo-image-free")
-PIXAZO_TTS_MODEL = os.environ.get("PIXAZO_TTS_MODEL", "pixazo-tts-1")
+PIXAZO_API_KEY = env("PIXAZO_API_KEY")
+# A blank PIXAZO_BASE_URL used to leave the request URL schemeless
+# ("No scheme supplied"), so always normalise it to an absolute https URL.
+PIXAZO_BASE_URL = env("PIXAZO_BASE_URL", "https://api.pixazo.ai").rstrip("/")
+if not PIXAZO_BASE_URL.startswith(("http://", "https://")):
+    PIXAZO_BASE_URL = f"https://{PIXAZO_BASE_URL}"
+PIXAZO_IMAGE_MODEL = env("PIXAZO_IMAGE_MODEL", "pixazo-image-free")
+PIXAZO_TTS_MODEL = env("PIXAZO_TTS_MODEL", "pixazo-tts-1")
 
-CF_ACCOUNT_ID = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "")
-CF_API_TOKEN = os.environ.get("CLOUDFLARE_API_TOKEN", "")
+CF_ACCOUNT_ID = env("CLOUDFLARE_ACCOUNT_ID")
+CF_API_TOKEN = env("CLOUDFLARE_API_TOKEN")
+CF_IMAGE_MODEL = env("CF_IMAGE_MODEL", "@cf/black-forest-labs/flux-1-schnell")
 # Workers AI retires older model ids (HTTP 410 Gone), so try current ones in order.
 CF_LLM_MODELS = [
     model.strip()
-    for model in os.environ.get(
+    for model in env(
         "CF_LLM_MODEL",
         "@cf/meta/llama-3.3-70b-instruct-fp8-fast,"
         "@cf/meta/llama-3.1-8b-instruct,"
@@ -224,23 +234,42 @@ def save_binary_or_b64(response: requests.Response, path: str, keys: tuple[str, 
     raise RuntimeError(f"Pixazo response contained no media: {json.dumps(body)[:300]}")
 
 
+def cloudflare_image(scene_prompt: str, path: str) -> None:
+    """Fallback image generator so a Pixazo outage does not fail the whole render."""
+    response = cloudflare_run(
+        CF_IMAGE_MODEL,
+        {
+            "prompt": f"{scene_prompt}, {IMAGE_STYLE}",
+            "negative_prompt": NEGATIVE_PROMPT or None,
+        },
+    )
+    save_binary_or_b64(response, path, ("b64_json", "image", "image_base64"))
+
+
 def generate_scenes(scene_prompts: list[str]) -> list[str]:
     log(f"Generating {len(scene_prompts)} scene images with Pixazo AI", "Generating scenes", 28)
     paths: list[str] = []
+    fallback_notified = False
     for index, scene_prompt in enumerate(scene_prompts):
         path = f"scene_{index}.jpg"
-        response = pixazo_post(
-            "/v1/images/generations",
-            {
-                "model": PIXAZO_IMAGE_MODEL,
-                "prompt": f"{scene_prompt}, {IMAGE_STYLE}",
-                "negative_prompt": NEGATIVE_PROMPT,
-                "width": WIDTH,
-                "height": HEIGHT,
-                "n": 1,
-            },
-        )
-        save_binary_or_b64(response, path, ("b64_json", "image", "image_base64"))
+        try:
+            response = pixazo_post(
+                "/v1/images/generations",
+                {
+                    "model": PIXAZO_IMAGE_MODEL,
+                    "prompt": f"{scene_prompt}, {IMAGE_STYLE}",
+                    "negative_prompt": NEGATIVE_PROMPT,
+                    "width": WIDTH,
+                    "height": HEIGHT,
+                    "n": 1,
+                },
+            )
+            save_binary_or_b64(response, path, ("b64_json", "image", "image_base64"))
+        except Exception as error:  # noqa: BLE001 - fall back to Cloudflare images
+            if not fallback_notified:
+                log(f"Pixazo images unavailable ({error}); using Cloudflare Workers AI images")
+                fallback_notified = True
+            cloudflare_image(scene_prompt, path)
         paths.append(path)
         log(f"scene {index + 1}/{len(scene_prompts)} ready")
     return paths
