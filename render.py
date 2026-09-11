@@ -151,28 +151,61 @@ def cloudflare_run(model: str, body: dict, *, timeout: int = 180) -> requests.Re
     return response
 
 
-def write_script() -> tuple[str, list[str]]:
-    """Returns (narration script, one image prompt per scene)."""
-    log(f"Writing the {DURATION}s script with Cloudflare Workers AI", "Writing script", 12)
-    words = max(12, int(DURATION * 2.4))  # ~145 wpm narration
-    instruction = (
-        f"Topic: {PROMPT}\n"
-        f"Write a narration script of about {words} words for a {DURATION} second video, "
-        f"then {SCENE_COUNT} vivid image prompts in the '{IMAGE_STYLE}' style.\n"
-        f"Avoid: {NEGATIVE_PROMPT or 'nothing in particular'}.\n"
-        'Reply with JSON only: {"script": "...", "scenes": ["...", "..."]}'
-    )
+def word_budget(duration: int) -> int:
+    """Hard word cap for the narration at a 130 WPM speaking standard.
+
+    Anchored to the product spec: 15s -> 30 words, 30s -> 65 words,
+    60s -> 120 words (absolute maximum), interpolated in between.
+    """
+    duration = max(1, min(60, int(duration)))
+    if duration <= 15:
+        return max(6, round(duration * 30 / 15))
+    if duration <= 30:
+        return round(30 + (duration - 15) * (65 - 30) / 15)
+    return min(120, round(65 + (duration - 30) * (120 - 65) / 30))
+
+
+WORD_BUDGET = word_budget(DURATION)
+
+NATURE_STYLE_PREFIX = (
+    "breathtaking humanless nature and cosmic scenery, planets, nebulae, starfields, "
+    "mountains, oceans, forests, macro micro-details, natural textures, volumetric light, "
+    "ultra detailed, no people"
+)
+HUMANLESS_NEGATIVE = "human, person, face, character, crowd, watermark, text"
+
+
+def image_prompt(scene_prompt: str) -> str:
+    """Humanless nature/cosmic prompt builder shared by every image provider."""
+    return f"{NATURE_STYLE_PREFIX}, {scene_prompt}, {IMAGE_STYLE}"[:1900]
+
+
+def image_negative_prompt() -> str:
+    extra = NEGATIVE_PROMPT.strip().strip(",")
+    return f"{HUMANLESS_NEGATIVE}, {extra}" if extra else HUMANLESS_NEGATIVE
+
+
+def trim_to_budget(script: str) -> str:
+    """Never let the narration exceed the duration's word cap."""
+    words = script.split()
+    if len(words) <= WORD_BUDGET:
+        return script.strip()
+    trimmed = " ".join(words[:WORD_BUDGET]).rstrip(" ,;:-")
+    if not trimmed.endswith((".", "!", "?")):
+        trimmed += "."
+    log(f"Script trimmed to {WORD_BUDGET} words for the {DURATION}s limit")
+    return trimmed
+
+
+def cf_chat(system: str, user: str, *, max_tokens: int = 700) -> str:
+    """Runs a chat prompt through the first Workers AI model that answers."""
     body = {
         "messages": [
-            {
-                "role": "system",
-                "content": "You are a short-form video director. Reply with strict JSON only.",
-            },
-            {"role": "user", "content": instruction},
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
         ],
-        "max_tokens": 900,
+        "max_tokens": max_tokens,
     }
-    text = ""
     for model in CF_LLM_MODELS:
         try:
             raw = cloudflare_run(model, body).json()
@@ -180,36 +213,113 @@ def write_script() -> tuple[str, list[str]]:
             log(f"Script model {model} unavailable ({error}); trying the next one")
             continue
 
-        # Cloudflare Workers AI response shape changed over time:
-        # { "result": { "response": "..." } } or { "response": "..." }
-        result = raw.get("result") or raw
-        if isinstance(result, dict):
-            candidate = result.get("response")
-            if candidate is None:
-                candidate = result.get("result")
-            text = str(candidate) if candidate is not None else ""
-        else:
-            text = str(result) if result is not None else ""
-        if text and text != "None":
-            break
+        # Workers AI response shapes: {"result":{"response":"..."}} or {"response":"..."}
+        result = raw.get("result") if isinstance(raw, dict) else None
+        if not isinstance(result, dict):
+            result = raw if isinstance(raw, dict) else {}
+        candidate = result.get("response")
+        if candidate is None:
+            candidate = result.get("result")
+        if isinstance(candidate, dict):
+            candidate = candidate.get("response") or candidate.get("text")
+        text = "" if candidate is None else str(candidate).strip()
+        if text and text.lower() != "none":
+            return text
+    return ""
 
-    # Always coerce to a plain string before string operations.
-    text = str(text)
+
+def clean_script(text: str) -> str:
+    """Strips list markers, labels and quotes an instruct model likes to add."""
+    if not text:
+        return ""
+    # A JSON reply is still accepted, but plain prose is the expected shape now.
     start, end = text.find("{"), text.rfind("}")
-    script, scenes = "", []
     if start != -1 and end > start:
         try:
             parsed = json.loads(text[start : end + 1])
-            script = str(parsed.get("script") or "").strip()
-            scenes = [str(s).strip() for s in (parsed.get("scenes") or []) if str(s).strip()]
+            if isinstance(parsed, dict) and parsed.get("script"):
+                text = str(parsed["script"])
         except json.JSONDecodeError:
             pass
+    lines = []
+    for line in text.splitlines():
+        line = line.strip().strip("`").strip()
+        low = line.lower()
+        if not line or low.startswith(("script:", "narration:", "here", "note:", "scene")):
+            continue
+        lines.append(line.lstrip("-*0123456789. ").strip('"'))
+    return " ".join(lines).strip()
 
+
+def parse_scenes(text: str) -> list[str]:
+    """Reads one image prompt per line (or from a JSON array) out of the reply."""
+    scenes: list[str] = []
+    start, end = text.find("["), text.rfind("]")
+    if start != -1 and end > start:
+        try:
+            parsed = json.loads(text[start : end + 1])
+            if isinstance(parsed, list):
+                scenes = [str(item).strip() for item in parsed if str(item).strip()]
+        except json.JSONDecodeError:
+            scenes = []
+    if not scenes:
+        for line in text.splitlines():
+            line = line.strip().lstrip("-*0123456789. ").strip('"').strip()
+            if len(line) > 12 and not line.lower().startswith(("here", "note", "scene prompts")):
+                scenes.append(line)
+    return scenes
+
+
+SCENE_VARIATIONS = [
+    "sweeping establishing wide shot",
+    "close orbital detail shot",
+    "dramatic low-angle vista",
+    "glowing nebula backdrop with depth",
+    "macro texture detail",
+    "silhouetted horizon at golden light",
+    "top-down aerial perspective",
+    "distant scale shot with layered depth",
+]
+
+
+def write_script() -> tuple[str, list[str]]:
+    """Returns (narration script, one image prompt per scene)."""
+    log(f"Writing the {DURATION}s script with Cloudflare Workers AI", "Writing script", 12)
+    lower = max(6, round(WORD_BUDGET * 0.8))
+
+    script = clean_script(
+        cf_chat(
+            "You are a narrator for humanless nature and cosmic short films. "
+            "Reply with the narration sentences only — no titles, labels, lists or notes.",
+            f"Topic: {PROMPT}\n"
+            f"Write flowing narration of between {lower} and {WORD_BUDGET} words so it reads "
+            f"aloud in about {DURATION} seconds at 130 words per minute. "
+            "No humans or characters, no stage directions, no hashtags.",
+            max_tokens=500,
+        )
+    )
     if not script:
-        log("Script model returned no usable JSON; narrating the prompt directly", None, None)
+        log("Script model gave no usable text; narrating the prompt directly", None, None)
         script = PROMPT
+    script = trim_to_budget(script)
+    log(f"Script ready ({len(script.split())} words / {WORD_BUDGET} max)")
+
+    scenes = parse_scenes(
+        cf_chat(
+            "You write image-generation prompts. Reply with one prompt per line, nothing else.",
+            f"Story: {script}\n"
+            f"Write exactly {SCENE_COUNT} distinct image prompts in the '{IMAGE_STYLE}' style "
+            "covering different moments of this story. Each prompt is one line, 15-30 words, "
+            "showing nature, cosmic space, planets, oceans or micro-detail scenery only — "
+            "never humans, faces, characters or text.\n"
+            f"Avoid: {NEGATIVE_PROMPT or 'nothing in particular'}.",
+            max_tokens=700,
+        )
+    )
+    # Every fallback scene gets its own camera angle so the clip never repeats one frame.
     while len(scenes) < SCENE_COUNT:
-        scenes.append(f"{PROMPT}, {IMAGE_STYLE}, scene {len(scenes) + 1}")
+        variation = SCENE_VARIATIONS[len(scenes) % len(SCENE_VARIATIONS)]
+        scenes.append(f"{PROMPT}, {variation}, {IMAGE_STYLE}")
     return script, scenes[:SCENE_COUNT]
 
 
@@ -267,7 +377,7 @@ def cloudflare_image(scene_prompt: str, path: str) -> None:
     # FLUX.1 Schnell's current REST contract needs only a prompt. Avoid sending
     # dimensions or sampling fields shared by other image models: Workers AI
     # rejects unsupported fields with HTTP 400.
-    prompt = f"{scene_prompt}, {IMAGE_STYLE}"[:1900]
+    prompt = image_prompt(scene_prompt)
     errors: list[str] = []
     for model in CF_IMAGE_MODELS:
         if "flux" in model:
@@ -276,7 +386,7 @@ def cloudflare_image(scene_prompt: str, path: str) -> None:
         else:
             body = {
                 "prompt": prompt,
-                "negative_prompt": NEGATIVE_PROMPT,
+                "negative_prompt": image_negative_prompt(),
                 "width": min(WIDTH, 1024),
                 "height": min(HEIGHT, 1024),
             }
@@ -300,8 +410,8 @@ def generate_scenes(scene_prompts: list[str]) -> list[str]:
                 "/v1/images/generations",
                 {
                     "model": PIXAZO_IMAGE_MODEL,
-                    "prompt": f"{scene_prompt}, {IMAGE_STYLE}",
-                    "negative_prompt": NEGATIVE_PROMPT,
+                    "prompt": image_prompt(scene_prompt),
+                    "negative_prompt": image_negative_prompt(),
                     "width": WIDTH,
                     "height": HEIGHT,
                     "n": 1,
@@ -358,45 +468,81 @@ def audio_duration(path: str) -> float:
         return float(DURATION)
 
 
-def srt_timestamp(seconds: float) -> str:
-    millis = int(round(seconds * 1000))
-    hours, millis = divmod(millis, 3_600_000)
-    minutes, millis = divmod(millis, 60_000)
-    secs, millis = divmod(millis, 1000)
-    return f"{hours:02d}:{minutes:02d}:{secs:02d},{millis:03d}"
+def ass_timestamp(seconds: float) -> str:
+    seconds = max(0.0, seconds)
+    centis = int(round(seconds * 100))
+    hours, centis = divmod(centis, 360_000)
+    minutes, centis = divmod(centis, 6_000)
+    secs, centis = divmod(centis, 100)
+    return f"{hours:d}:{minutes:02d}:{secs:02d}.{centis:02d}"
 
 
-def write_srt(script: str, total: float, path: str = "captions.srt") -> str:
-    """Distributes the narration across short cues proportional to word count."""
+CAPTION_PRESETS = {
+    # PrimaryColour / OutlineColour are ASS &HAABBGGRR values.
+    "Yellow Pop-Up": {"primary": "&H0000E5FF", "outline": "&H00000000", "bold": -1, "border": 4},
+    "Neon Glow": {"primary": "&H00FFFFFF", "outline": "&H00CC00FF", "bold": -1, "border": 5},
+    "Minimalist White": {"primary": "&H00FFFFFF", "outline": "&H00000000", "bold": 0, "border": 3},
+    "Monospace Subtitles": {"primary": "&H00FFFFFF", "outline": "&H00000000", "bold": 0, "border": 3},
+}
+
+
+def write_ass(script: str, total: float, path: str = "captions.ass") -> str:
+    """Bottom-centre captions, 3-4 words per cue, at a real 44px on a 1080x1920 canvas.
+
+    An ASS file is generated directly (instead of an SRT + force_style) because
+    force_style sizes are relative to libass' default 384x288 script resolution,
+    which is what previously blew the text up to full-screen height.
+    """
     words = script.split()
     if not words:
         words = [PROMPT or "…"]
-    per_cue = 7
+    per_cue = 4  # 3-4 words per frame keeps shorts captions readable
     cues = [words[i : i + per_cue] for i in range(0, len(words), per_cue)]
     weight = sum(len(" ".join(c)) for c in cues) or 1
+
+    preset = CAPTION_PRESETS.get(CAPTION_STYLE, CAPTION_PRESETS["Minimalist White"])
+    font = "DejaVu Sans Mono" if CAPTION_STYLE == "Monospace Subtitles" else "DejaVu Sans"
+    font_size = max(22, round(HEIGHT * 44 / 1920))
+    # Alignment 2 = bottom centre; the baseline sits at roughly 88% of the canvas.
+    margin_v = max(24, round(HEIGHT * 0.10))
+    margin_h = max(40, round(WIDTH * 0.08))
+
+    header = (
+        "[Script Info]\n"
+        "ScriptType: v4.00+\n"
+        "WrapStyle: 0\n"
+        "ScaledBorderAndShadow: yes\n"
+        f"PlayResX: {WIDTH}\n"
+        f"PlayResY: {HEIGHT}\n\n"
+        "[V4+ Styles]\n"
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, "
+        "BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, "
+        "BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
+        f"Style: Caption,{font},{font_size},{preset['primary']},{preset['primary']},"
+        f"{preset['outline']},&H80000000,{preset['bold']},0,0,0,100,100,0,0,1,"
+        f"{preset['border']},1,2,{margin_h},{margin_h},{margin_v},1\n\n"
+        "[Events]\n"
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
+    )
+
     clock = 0.0
     with open(path, "w", encoding="utf-8") as handle:
-        for index, cue in enumerate(cues, start=1):
-            text = " ".join(cue)
-            span = max(0.6, total * (len(text) / weight))
+        handle.write(header)
+        for cue in cues:
+            text = " ".join(cue).replace("\n", " ")
+            span = max(0.5, total * (len(text) / weight))
             start, end = clock, min(total, clock + span)
             clock = end
-            handle.write(f"{index}\n{srt_timestamp(start)} --> {srt_timestamp(end)}\n{text}\n\n")
+            handle.write(
+                f"Dialogue: 0,{ass_timestamp(start)},{ass_timestamp(end)},Caption,,0,0,0,,{text}\n"
+            )
     log(f"Burning {len(cues)} caption cues ({CAPTION_STYLE})", "Rendering captions", 68)
     return path
 
 
-def caption_filter(srt_path: str) -> str:
-    """ASS style per caption preset, applied through the FFmpeg subtitles filter."""
-    base = f"Fontsize={max(16, HEIGHT // 34)},Alignment=2,MarginV={max(40, HEIGHT // 14)},Outline=2,Shadow=1"
-    styles = {
-        "Yellow Pop-Up": f"FontName=DejaVu Sans,{base},Bold=1,PrimaryColour=&H0000E5FF,OutlineColour=&H00000000",
-        "Neon Glow": f"FontName=DejaVu Sans,{base},Bold=1,PrimaryColour=&H00FFFFFF,OutlineColour=&H00FF00CC,Outline=3",
-        "Minimalist White": f"FontName=DejaVu Sans,{base},PrimaryColour=&H00FFFFFF,OutlineColour=&H64000000",
-        "Monospace Subtitles": f"FontName=DejaVu Sans Mono,{base},PrimaryColour=&H00FFFFFF,OutlineColour=&H00000000",
-    }
-    style = styles.get(CAPTION_STYLE, styles["Minimalist White"])
-    return f"subtitles={srt_path}:force_style='{style}'"
+def caption_filter(ass_path: str) -> str:
+    """Burns the generated ASS captions (styling lives in the file itself)."""
+    return f"subtitles={ass_path}"
 
 
 def motion_filter(per_scene: float) -> str:
@@ -409,13 +555,22 @@ def motion_filter(per_scene: float) -> str:
     if MOTION_TEMPLATE == "Fade Transitions":
         return f"zoompan=z=1.02:d={frames}:s={WIDTH}x{HEIGHT}:fps=30,fade=t=in:st=0:d=0.4"
     # Auto Zoom-In (default)
-    return f"zoompan=z='min(zoom+0.0012,1.30)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames}:s={WIDTH}x{HEIGHT}:fps=30"
+    return f"zoompan=z='min(zoom+0.003,1.30)':x='iw/2-(iw/zoom/2)':y='ih/2-(ih/zoom/2)':d={frames}:s={WIDTH}x{HEIGHT}:fps=30"
 
 
 def compose(scenes: list[str], voice: str, script: str) -> None:
     log("Composing final video with FFmpeg", "Rendering video", 78)
     narration = audio_duration(voice)
-    total = max(1.0, min(float(DURATION), narration)) if narration > DURATION else float(DURATION)
+
+    # The video length follows the narration so a short voiceover never leaves
+    # the clip ending in dead silence, and never exceeds the selected duration.
+    tail = 0.6
+    total = min(float(DURATION), max(2.0, narration + tail))
+    if narration + tail < DURATION - 0.5:
+        log(
+            f"Narration is {narration:.1f}s, so the clip is trimmed to "
+            f"{total:.1f}s instead of {DURATION}s"
+        )
     per_scene = total / len(scenes)
 
     with open("scenes.txt", "w", encoding="utf-8") as handle:
@@ -429,7 +584,7 @@ def compose(scenes: list[str], voice: str, script: str) -> None:
         motion_filter(per_scene),
     ]
     if CAPTIONS:
-        filters.append(caption_filter(write_srt(script, total)))
+        filters.append(caption_filter(write_ass(script, min(total, narration))))
     else:
         log("Captions disabled for this render", None, None)
     filters.append("format=yuv420p")
@@ -438,7 +593,9 @@ def compose(scenes: list[str], voice: str, script: str) -> None:
         "ffmpeg", "-y",
         "-f", "concat", "-safe", "0", "-i", "scenes.txt",
         "-i", voice,
-        "-vf", ",".join(filters),
+        "-filter_complex",
+        f"[0:v]{','.join(filters)}[v];[1:a]apad,atrim=0:{total:.3f},asetpts=N/SR/TB[a]",
+        "-map", "[v]", "-map", "[a]",
         "-c:v", "libx264", "-preset", "medium", "-crf", "20", "-b:v", VIDEO_BITRATE,
         "-c:a", "aac", "-b:a", "192k",
         "-r", "30", "-t", f"{total:.3f}", "-movflags", "+faststart",
@@ -446,8 +603,8 @@ def compose(scenes: list[str], voice: str, script: str) -> None:
     ]
     result = subprocess.run(command, capture_output=True, text=True)
     if result.returncode != 0:
-        tail = (result.stderr or "").strip().splitlines()[-6:]
-        raise RuntimeError("FFmpeg failed: " + " | ".join(tail))
+        detail = (result.stderr or "").strip().splitlines()[-6:]
+        raise RuntimeError("FFmpeg failed: " + " | ".join(detail))
 
 
 def main() -> int:
