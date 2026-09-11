@@ -15,6 +15,7 @@ Progress is written back to Supabase so the Lovable UI terminal streams it live.
 """
 
 import base64
+import hashlib
 import json
 import math
 import os
@@ -61,7 +62,16 @@ PIXAZO_TTS_MODEL = env("PIXAZO_TTS_MODEL", "pixazo-tts-1")
 
 CF_ACCOUNT_ID = env("CLOUDFLARE_ACCOUNT_ID")
 CF_API_TOKEN = env("CLOUDFLARE_API_TOKEN")
-CF_IMAGE_MODEL = env("CF_IMAGE_MODEL", "@cf/black-forest-labs/flux-1-schnell")
+CF_IMAGE_MODELS = [
+    model.strip()
+    for model in env(
+        "CF_IMAGE_MODEL",
+        "@cf/black-forest-labs/flux-1-schnell,"
+        "@cf/stabilityai/stable-diffusion-xl-base-1.0,"
+        "@cf/bytedance/stable-diffusion-xl-lightning",
+    ).split(",")
+    if model.strip()
+]
 # Workers AI retires older model ids (HTTP 410 Gone), so try current ones in order.
 CF_LLM_MODELS = [
     model.strip()
@@ -116,10 +126,14 @@ def cloudflare_run(model: str, body: dict, *, timeout: int = 180) -> requests.Re
     response = requests.post(
         f"https://api.cloudflare.com/client/v4/accounts/{CF_ACCOUNT_ID}/ai/run/{model}",
         headers={"Authorization": f"Bearer {CF_API_TOKEN}"},
-        json=body,
+        # Workers AI rejects null values, so never send empty fields.
+        json={key: value for key, value in body.items() if value not in (None, "")},
         timeout=timeout,
     )
-    response.raise_for_status()
+    if not response.ok:
+        raise RuntimeError(
+            f"Workers AI {model} failed ({response.status_code}): {response.text[:300]}"
+        )
     return response
 
 
@@ -236,14 +250,29 @@ def save_binary_or_b64(response: requests.Response, path: str, keys: tuple[str, 
 
 def cloudflare_image(scene_prompt: str, path: str) -> None:
     """Fallback image generator so a Pixazo outage does not fail the whole render."""
-    response = cloudflare_run(
-        CF_IMAGE_MODEL,
-        {
-            "prompt": f"{scene_prompt}, {IMAGE_STYLE}",
-            "negative_prompt": NEGATIVE_PROMPT or None,
-        },
-    )
-    save_binary_or_b64(response, path, ("b64_json", "image", "image_base64"))
+    # FLUX.1 Schnell's current REST contract needs only a prompt. Avoid sending
+    # dimensions or sampling fields shared by other image models: Workers AI
+    # rejects unsupported fields with HTTP 400.
+    prompt = f"{scene_prompt}, {IMAGE_STYLE}"[:1900]
+    errors: list[str] = []
+    for model in CF_IMAGE_MODELS:
+        if "flux" in model:
+            seed = int(hashlib.sha256(prompt.encode("utf-8")).hexdigest()[:8], 16)
+            body = {"prompt": prompt, "seed": seed}
+        else:
+            body = {
+                "prompt": prompt,
+                "negative_prompt": NEGATIVE_PROMPT,
+                "width": min(WIDTH, 1024),
+                "height": min(HEIGHT, 1024),
+            }
+        try:
+            response = cloudflare_run(model, body)
+            save_binary_or_b64(response, path, ("b64_json", "image", "image_base64"))
+            return
+        except Exception as error:  # noqa: BLE001 - try the next image model
+            errors.append(f"{model}: {error}")
+    raise RuntimeError("no Workers AI image model succeeded — " + " | ".join(errors))
 
 
 def generate_scenes(scene_prompts: list[str]) -> list[str]:
